@@ -29,23 +29,86 @@
 #define DB_TO_LINEAR(x) pow (10., (x) / 20.)
 #define LINEAR_TO_DB(x) (20. * log10 (x))
 
+/* Once finished prototyping, refactor all this junk into a slicer class plz */
 static int file_seqno = 0;
+static GstClockTime slice_start = 0;
+static gdouble min_slice_length = 1 * GST_SECOND;
+static gdouble silence_threshold = -40;
+static GstElement* pipeline;
+static GstElement* wavenc;
+static GstElement* sink;
+static gboolean unsafe_lock_dont_keep = FALSE;
 
-static void attach_next_file(GstElement* pipeline) {
+static GstPadProbeReturn
+create_new_filesink(GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  if (GST_EVENT_TYPE(GST_PAD_PROBE_INFO_DATA(info)) != GST_EVENT_EOS) {
+    return GST_PAD_PROBE_OK;
+  }
+
+  gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
+
+  gst_element_set_state (sink, GST_STATE_NULL);
+
+  /* remove unlinks automatically */
+  GST_DEBUG_OBJECT (pipeline, "removing %" GST_PTR_FORMAT, sink);
+  gst_bin_remove (GST_BIN (pipeline), sink);
+
+  sink = gst_element_factory_make("filesink", NULL);
+  g_object_set(G_OBJECT(sink), "sync", TRUE, NULL);
+  g_object_set(G_OBJECT(sink), "async", FALSE, NULL);
   char next_file_name[16];
   sprintf(next_file_name, "./%d.wav", file_seqno++);
+  g_object_set(G_OBJECT(sink), "location", next_file_name, NULL);
 
-  GstStateChangeReturn result =
-  gst_element_set_state(pipeline, GST_STATE_PAUSED);
-  g_assert(GST_STATE_CHANGE_SUCCESS == result);
-  GstElement* new_filesink = gst_element_factory_make("filesink", NULL);
-  g_object_set(G_OBJECT(new_filesink), "location", next_file_name, NULL);
+  GST_DEBUG_OBJECT (pipeline, "adding   %" GST_PTR_FORMAT, sink);
+  gst_bin_add(GST_BIN (pipeline), sink);
+
+  GstStateChangeReturn state = gst_element_set_state(wavenc, GST_STATE_NULL);
+
+  GST_DEBUG_OBJECT (pipeline, "linking..");
+  gst_element_link_many(wavenc, sink, NULL);
+
+  state = gst_element_set_state(wavenc, GST_STATE_PLAYING);
+  gst_element_set_state(sink, GST_STATE_PLAYING);
+
+  GST_DEBUG_OBJECT (pipeline, "done");
+
+  unsafe_lock_dont_keep = FALSE;
+
+  return GST_PAD_PROBE_DROP;
 }
+
+static GstPadProbeReturn
+pad_probe_cb(GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstPad *srcpad, *sinkpad;
+
+  GST_DEBUG_OBJECT (pad, "pad is blocked now");
+
+  /* remove the probe first */
+  gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
+
+  /* install new probe for EOS */
+  sinkpad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (sinkpad, GST_PAD_PROBE_TYPE_BLOCK |
+                     GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, create_new_filesink,
+                     user_data, NULL);
+
+  /* push EOS into the element, the probe will be fired when the
+   * EOS leaves the effect and it has thus drained all of its data */
+  gst_pad_send_event (sinkpad, gst_event_new_eos ());
+  gst_object_unref (sinkpad);
+
+  return GST_PAD_PROBE_OK;
+}
+
 
 static gboolean
 message_handler (GstBus * bus, GstMessage * message, gpointer data)
 {
   gboolean next_file_trigger = 0;
+  GstClockTime endtime;
 
   if (message->type == GST_MESSAGE_ELEMENT) {
     const GstStructure *s = gst_message_get_structure (message);
@@ -53,7 +116,6 @@ message_handler (GstBus * bus, GstMessage * message, gpointer data)
 
     if (strcmp (name, "level") == 0) {
       gint channels;
-      GstClockTime endtime;
       gdouble rms_dB, peak_dB, decay_dB;
       gdouble rms;
       const GValue *array_val;
@@ -79,6 +141,7 @@ message_handler (GstBus * bus, GstMessage * message, gpointer data)
       channels = rms_arr->n_values;
       g_print ("endtime: %" GST_TIME_FORMAT ", channels: %d\n",
           GST_TIME_ARGS (endtime), channels);
+
       for (i = 0; i < channels; ++i) {
 
         g_print ("channel %d\n", i);
@@ -97,14 +160,24 @@ message_handler (GstBus * bus, GstMessage * message, gpointer data)
         rms = pow (10, rms_dB / 20);
         g_print ("    normalized rms value: %f\n", rms);
       }
+
+      // define a simple heuristic for swapping from one file to the next
+      gdouble slice_duration = endtime - slice_start;
+      next_file_trigger = (rms_dB < silence_threshold &&
+                           slice_duration > min_slice_length);
     }
   }
 
-  // define heuristic for swapping from one file to the next
-  if (next_file_trigger) {
-    // dig out the pipeline and element before final sink for relinking
-    attach_next_file(NULL);
+  if (next_file_trigger && !unsafe_lock_dont_keep) {
+    unsafe_lock_dont_keep = TRUE;
+    slice_start = endtime;
+    GstPad* blockpad = gst_element_get_static_pad (wavenc, "src");
+    // Block the encoder so we can flush and swap output sinks
+    gst_pad_add_probe(blockpad, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
+                      pad_probe_cb, NULL, NULL);
+    gst_object_unref(blockpad);
   }
+  
   /* we handled the message we want, and ignored the ones we didn't want.
    * so the core can unref the message for us */
   return TRUE;
@@ -113,9 +186,8 @@ message_handler (GstBus * bus, GstMessage * message, gpointer data)
 int
 main (int argc, char *argv[])
 {
-  GstElement *filesrc, *wavparse, *audioconvert, *level, *fakesink;
+  GstElement *filesrc, *wavparse, *audioconvert, *level;
   GstElement *compressor, *volume;
-  GstElement *pipeline;
   GstCaps *caps;
   GstBus *bus;
   guint watch_id;
@@ -123,28 +195,28 @@ main (int argc, char *argv[])
 
   gst_init (&argc, &argv);
 
-  caps = gst_caps_from_string ("audio/x-raw,channels=2");
+  caps = gst_caps_from_string("audio/x-raw,channels=1");
 
-  pipeline = gst_pipeline_new (NULL);
-  g_assert (pipeline);
-  filesrc = gst_element_factory_make ("filesrc", NULL);
-  g_assert (filesrc);
-  wavparse = gst_element_factory_make ("wavparse", NULL);
-  g_assert (wavparse);
-  audioconvert = gst_element_factory_make ("audioconvert", NULL);
-  g_assert (audioconvert);
+  pipeline = gst_pipeline_new(NULL);
+  g_assert(pipeline);
+  filesrc = gst_element_factory_make("filesrc", NULL);
+  g_assert(filesrc);
+  wavparse = gst_element_factory_make("wavparse", NULL);
+  g_assert(wavparse);
+  audioconvert = gst_element_factory_make("audioconvert", NULL);
+  g_assert(audioconvert);
   compressor = gst_element_factory_make("audiodynamic", NULL);
   g_assert(compressor);
   volume = gst_element_factory_make("volume", NULL);
   g_assert(volume);
-  level = gst_element_factory_make ("level", NULL);
-  g_assert (level);
-  fakesink = gst_element_factory_make ("autoaudiosink", NULL);
-  g_assert (fakesink);
+  level = gst_element_factory_make("level", NULL);
+  g_assert(level);
+  wavenc = gst_element_factory_make("wavenc", NULL);
+  g_assert(wavenc);
 
   gst_bin_add_many(GST_BIN(pipeline), filesrc, wavparse, audioconvert,
-                   compressor, volume, level,
-                   fakesink, NULL);
+                   compressor, volume, level, wavenc,
+                   sink, NULL);
 
   if (!gst_element_link (filesrc, wavparse))
     g_error ("Failed to link filesrc and wavparse");
@@ -152,14 +224,18 @@ main (int argc, char *argv[])
     g_error ("Failed to link wavparse and audioconvert");
   if (!gst_element_link_filtered (audioconvert, compressor, caps))
     g_error ("Failed to link audioconvert and compressor");
-  if (!gst_element_link_many(compressor, volume, level, fakesink, NULL))
-    g_error ("Failed to link compressor, level, and fakesink");
+  if (!gst_element_link_many(compressor, volume, level, wavenc, NULL))
+    g_error ("Failed to link compressor, level, and wavenc");
 
   g_object_set(G_OBJECT(filesrc), "location", "/Users/charley/src/bsmh/slicer/test.wav", NULL);
   /*
    use some "best guess" compressor config.
    this should probably have a smarter heuristic
    */
+  g_object_set(G_OBJECT(audioconvert),
+               /* */
+               "dithering", 0,
+               NULL);
   g_object_set(G_OBJECT(compressor),
                /* */
                "characteristics", "soft-knee",
@@ -174,8 +250,8 @@ main (int argc, char *argv[])
                /*
                 target gain compensates for compressor and original track volume,
                 but is fundamentally an assumption.
-                again, this needs pre-analysis for tracks recorded outside
-                charley's studio
+                again, this needs pre-analysis for non-normalized tracks
+
                 */
                "volume", DB_TO_LINEAR(12.0),
                NULL);
@@ -189,16 +265,24 @@ main (int argc, char *argv[])
                 /* falloff config similar to vocal compression release */
                 "peak-ttl", 50 * GST_MSECOND,
                 NULL);
-  /* run synced and not as fast as we can */
-  g_object_set (G_OBJECT (fakesink), "sync", TRUE, NULL);
 
-  bus = gst_element_get_bus (pipeline);
-  watch_id = gst_bus_add_watch (bus, message_handler, NULL);
+  bus = gst_element_get_bus(pipeline);
+  watch_id = gst_bus_add_watch(bus, message_handler, NULL);
+
+
+  char next_file_name[16];
+  sprintf(next_file_name, "./%d.wav", file_seqno++);
+  sink = gst_element_factory_make("filesink", NULL);
+  g_object_set(G_OBJECT(sink), "sync", TRUE, NULL);
+  g_object_set(G_OBJECT(sink), "async", FALSE, NULL);
+  g_object_set(G_OBJECT(sink), "location", next_file_name, NULL);
+  g_assert(gst_bin_add(GST_BIN(pipeline), sink));
+  g_assert(gst_element_link(wavenc, sink));
 
   GST_DEBUG_BIN_TO_DOT_FILE(GST_BIN(pipeline),
                             GST_DEBUG_GRAPH_SHOW_ALL, "pipeline");
 
-  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
   /* we need to run a GLib main loop to get the messages */
   loop = g_main_loop_new (NULL, FALSE);
