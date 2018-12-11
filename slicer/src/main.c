@@ -177,7 +177,7 @@ message_handler (GstBus * bus, GstMessage * message, gpointer data)
                       pad_probe_cb, NULL, NULL);
     gst_object_unref(blockpad);
   }
-  
+
   /* we handled the message we want, and ignored the ones we didn't want.
    * so the core can unref the message for us */
   return TRUE;
@@ -195,7 +195,7 @@ main (int argc, char *argv[])
 
   gst_init (&argc, &argv);
 
-  caps = gst_caps_from_string("audio/x-raw,channels=1");
+  caps = gst_caps_from_string("audio/x-raw,format=F32LE,channels=1");
 
   pipeline = gst_pipeline_new(NULL);
   g_assert(pipeline);
@@ -233,7 +233,7 @@ main (int argc, char *argv[])
    this should probably have a smarter heuristic
    */
   g_object_set(G_OBJECT(audioconvert),
-               /* */
+               /* we'll dither again in post; don't do it on a depth increase */
                "dithering", 0,
                NULL);
   g_object_set(G_OBJECT(compressor),
