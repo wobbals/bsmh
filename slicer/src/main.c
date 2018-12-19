@@ -33,7 +33,7 @@
 static int file_seqno = 0;
 static GstClockTime slice_start = 0;
 static gdouble min_slice_length = 1 * GST_SECOND;
-static gdouble silence_threshold = -40;
+static gdouble silence_threshold = -36;
 static GstElement* pipeline;
 static GstElement* wavenc;
 static GstElement* level;
@@ -53,40 +53,18 @@ create_new_filesink(GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   GstStateChangeReturn state = gst_element_set_state(wavenc, GST_STATE_NULL);
   state = gst_element_set_state(sink, GST_STATE_NULL);
 
-  /* remove unlinks automatically */
-  GST_DEBUG_OBJECT (pipeline, "removing %" GST_PTR_FORMAT, sink);
-  gst_bin_remove (GST_BIN (pipeline), sink);
-
-  sink = gst_element_factory_make("filesink", NULL);
-  g_object_set(G_OBJECT(sink), "sync", TRUE, NULL);
-  g_object_set(G_OBJECT(sink), "async", FALSE, NULL);
   char next_file_name[16];
   sprintf(next_file_name, "./%d.wav", file_seqno++);
   g_object_set(G_OBJECT(sink), "location", next_file_name, NULL);
 
-  GST_DEBUG_OBJECT (pipeline, "adding   %" GST_PTR_FORMAT, sink);
-  gst_bin_add(GST_BIN (pipeline), sink);
-
-
-  GST_DEBUG_OBJECT (pipeline, "linking..");
-  gst_element_link_many(wavenc, sink, NULL);
-
   state = gst_element_set_state(wavenc, GST_STATE_PLAYING);
-  gst_element_set_state(sink, GST_STATE_PLAYING);
+  state = gst_element_set_state(sink, GST_STATE_PLAYING);
 
   GST_DEBUG_OBJECT (pipeline, "done");
 
   unsafe_lock_dont_keep = FALSE;
 
   return GST_PAD_PROBE_DROP;
-}
-
-static GstPadProbeReturn
-dummy_pad_probe(GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
-{
-  GstEventType event_type = GST_EVENT_TYPE(GST_PAD_PROBE_INFO_DATA(info));
-  gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
-  return GST_PAD_PROBE_PASS;
 }
 
 static GstPadProbeReturn
