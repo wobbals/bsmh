@@ -36,19 +36,22 @@ static gdouble min_slice_length = 1 * GST_SECOND;
 static gdouble silence_threshold = -40;
 static GstElement* pipeline;
 static GstElement* wavenc;
+static GstElement* level;
 static GstElement* sink;
 static gboolean unsafe_lock_dont_keep = FALSE;
 
 static GstPadProbeReturn
 create_new_filesink(GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
-  if (GST_EVENT_TYPE(GST_PAD_PROBE_INFO_DATA(info)) != GST_EVENT_EOS) {
-    return GST_PAD_PROBE_OK;
+  GstEventType event_type = GST_EVENT_TYPE(GST_PAD_PROBE_INFO_DATA(info));
+  if (event_type != GST_EVENT_EOS) {
+    return GST_PAD_PROBE_PASS;
   }
 
   gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
 
-  gst_element_set_state (sink, GST_STATE_NULL);
+  GstStateChangeReturn state = gst_element_set_state(wavenc, GST_STATE_NULL);
+  state = gst_element_set_state(sink, GST_STATE_NULL);
 
   /* remove unlinks automatically */
   GST_DEBUG_OBJECT (pipeline, "removing %" GST_PTR_FORMAT, sink);
@@ -64,7 +67,6 @@ create_new_filesink(GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   GST_DEBUG_OBJECT (pipeline, "adding   %" GST_PTR_FORMAT, sink);
   gst_bin_add(GST_BIN (pipeline), sink);
 
-  GstStateChangeReturn state = gst_element_set_state(wavenc, GST_STATE_NULL);
 
   GST_DEBUG_OBJECT (pipeline, "linking..");
   gst_element_link_many(wavenc, sink, NULL);
@@ -80,9 +82,17 @@ create_new_filesink(GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 }
 
 static GstPadProbeReturn
+dummy_pad_probe(GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstEventType event_type = GST_EVENT_TYPE(GST_PAD_PROBE_INFO_DATA(info));
+  gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
+  return GST_PAD_PROBE_PASS;
+}
+
+static GstPadProbeReturn
 pad_probe_cb(GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
-  GstPad *srcpad, *sinkpad;
+  GstPad *eospad, *finalpad;
 
   GST_DEBUG_OBJECT (pad, "pad is blocked now");
 
@@ -90,22 +100,25 @@ pad_probe_cb(GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
 
   /* install new probe for EOS */
-  sinkpad = gst_element_get_static_pad (sink, "sink");
-  gst_pad_add_probe (sinkpad, GST_PAD_PROBE_TYPE_BLOCK |
+  finalpad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (finalpad, GST_PAD_PROBE_TYPE_BLOCK |
                      GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, create_new_filesink,
                      user_data, NULL);
 
   /* push EOS into the element, the probe will be fired when the
    * EOS leaves the effect and it has thus drained all of its data */
-  gst_pad_send_event (sinkpad, gst_event_new_eos ());
-  gst_object_unref (sinkpad);
+  eospad = gst_element_get_static_pad(wavenc, "sink");
+  gst_pad_send_event(eospad, gst_event_new_eos());
+
+  /* unref pads used for this operation */
+  gst_object_unref(eospad);
+  gst_object_unref(finalpad);
 
   return GST_PAD_PROBE_OK;
 }
 
-
 static gboolean
-message_handler (GstBus * bus, GstMessage * message, gpointer data)
+level_message_handler (GstBus * bus, GstMessage * message, gpointer data)
 {
   gboolean next_file_trigger = 0;
   GstClockTime endtime;
@@ -140,7 +153,7 @@ message_handler (GstBus * bus, GstMessage * message, gpointer data)
        * arrays */
       channels = rms_arr->n_values;
       g_print ("endtime: %" GST_TIME_FORMAT ", channels: %d\n",
-          GST_TIME_ARGS (endtime), channels);
+               GST_TIME_ARGS (endtime), channels);
 
       for (i = 0; i < channels; ++i) {
 
@@ -154,7 +167,7 @@ message_handler (GstBus * bus, GstMessage * message, gpointer data)
         value = g_value_array_get_nth (decay_arr, i);
         decay_dB = g_value_get_double (value);
         g_print ("    RMS: %f dB, peak: %f dB, decay: %f dB\n",
-            rms_dB, peak_dB, decay_dB);
+                 rms_dB, peak_dB, decay_dB);
 
         /* converting from dB to normal gives us a value between 0.0 and 1.0 */
         rms = pow (10, rms_dB / 20);
@@ -171,7 +184,7 @@ message_handler (GstBus * bus, GstMessage * message, gpointer data)
   if (next_file_trigger && !unsafe_lock_dont_keep) {
     unsafe_lock_dont_keep = TRUE;
     slice_start = endtime;
-    GstPad* blockpad = gst_element_get_static_pad (wavenc, "src");
+    GstPad* blockpad = gst_element_get_static_pad (level, "src");
     // Block the encoder so we can flush and swap output sinks
     gst_pad_add_probe(blockpad, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
                       pad_probe_cb, NULL, NULL);
@@ -186,7 +199,7 @@ message_handler (GstBus * bus, GstMessage * message, gpointer data)
 int
 main (int argc, char *argv[])
 {
-  GstElement *filesrc, *wavparse, *audioconvert, *level;
+  GstElement *filesrc, *wavparse, *audioconvert;
   GstElement *compressor, *volume;
   GstCaps *caps;
   GstBus *bus;
@@ -256,18 +269,18 @@ main (int argc, char *argv[])
                "volume", DB_TO_LINEAR(12.0),
                NULL);
   g_object_set(G_OBJECT(level),
-                /* make sure we'll get messages */
-                "post-messages", TRUE,
-                /* work on 20ms boundaries */
-                "interval", 20 * GST_MSECOND,
-                /* 24 dB/second falloff */
-                "peak-falloff", 24.0,
-                /* falloff config similar to vocal compression release */
-                "peak-ttl", 50 * GST_MSECOND,
-                NULL);
+               /* make sure we'll get messages */
+               "post-messages", TRUE,
+               /* work on 20ms boundaries */
+               "interval", 20 * GST_MSECOND,
+               /* 24 dB/second falloff */
+               "peak-falloff", 24.0,
+               /* falloff config similar to vocal compression release */
+               "peak-ttl", 50 * GST_MSECOND,
+               NULL);
 
   bus = gst_element_get_bus(pipeline);
-  watch_id = gst_bus_add_watch(bus, message_handler, NULL);
+  watch_id = gst_bus_add_watch(bus, level_message_handler, NULL);
 
 
   char next_file_name[16];
